@@ -2,6 +2,7 @@
   lib,
   stdenv,
   bun2nix,
+  curl,
 }:
 # Build the SvelteKit demo into a single, standalone Bun binary.
 #
@@ -17,6 +18,7 @@ stdenv.mkDerivation (finalAttrs: {
   src = ./.;
 
   nativeBuildInputs = [ bun2nix.hook ];
+  nativeInstallCheckInputs = [ curl ];
 
   # Offline, reproducible Bun install cache built purely from ./bun.nix.
   bunDeps = bun2nix.fetchBunDeps {
@@ -35,8 +37,9 @@ stdenv.mkDerivation (finalAttrs: {
   dontUseBunCheck = true;
 
   # `bun build --compile` appends the bundled module graph to the executable;
-  # fixupPhase's strip would discard it, leaving a bare `bun` that prints CLI help.
-  dontStrip = true;
+  # fixupPhase (strip/patchelf) discards it, leaving a bare `bun` that prints CLI
+  # help. bun2nix's own mkDerivation defaults to dontFixup for the same reason.
+  dontFixup = true;
 
   buildPhase = ''
     runHook preBuild
@@ -75,6 +78,30 @@ stdenv.mkDerivation (finalAttrs: {
     fi
 
     runHook postInstall
+  '';
+
+  # Smoke-test the installed binary: a broken compile (e.g. fixup stripping the
+  # embedded module graph) degrades into a bare `bun` CLI that exits 0, so
+  # actually start the server and require an HTTP response.
+  doInstallCheck = true;
+  installCheckPhase = ''
+    runHook preInstallCheck
+
+    HOST=127.0.0.1 PORT=18345 $out/bin/${finalAttrs.pname} &
+    server=$!
+    trap 'kill $server 2>/dev/null || true' EXIT
+    for i in $(seq 1 50); do
+      if curl -fsS http://127.0.0.1:18345/ > /dev/null 2>&1; then
+        echo "install check: server responded"
+        runHook postInstallCheck
+        exit 0
+      fi
+      # Bail early if the binary already exited (bare-bun help text exits 0).
+      kill -0 $server 2>/dev/null || break
+      sleep 0.2
+    done
+    echo "install check: server never responded on :18345" >&2
+    exit 1
   '';
 
   meta = {
