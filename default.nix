@@ -34,6 +34,10 @@ stdenv.mkDerivation (finalAttrs: {
   dontUseBunBuild = true;
   dontUseBunCheck = true;
 
+  # `bun build --compile` appends the bundled module graph to the executable;
+  # fixupPhase's strip would discard it, leaving a bare `bun` that prints CLI help.
+  dontStrip = true;
+
   buildPhase = ''
     runHook preBuild
 
