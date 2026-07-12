@@ -1,6 +1,6 @@
 ---
 name: sveltekit-bun2nix
-description: Package a Bun-based SvelteKit project into a Nix flake with bun2nix, producing a single standalone Bun binary whose runtime closure contains no dev dependencies. Use when a user wants to build/deploy a SvelteKit (or similar Bun-served) app with Nix, "compile SvelteKit to a bun binary", write a flake/default.nix/bun.nix for a Bun web app, or set up a NixOS module/service for a SvelteKit app. Covers svelte-adapter-bun, bun2nix hook + fetchBunDeps, the import.meta.dir asset-path gotcha, and a clean flake with package/overlay/app/nixosModule.
+description: Package a Bun-based SvelteKit project into a Nix flake with bun2nix, producing a single standalone Bun binary whose runtime closure contains no dev dependencies. Use when a user wants to build/deploy a SvelteKit (or similar Bun-served) app with Nix, "compile SvelteKit to a bun binary", write a flake/default.nix/bun.nix for a Bun web app, or set up a NixOS module/service for a SvelteKit app. Covers svelte-adapter-bun, bun2nix.mkDerivation + fetchBunDeps, the import.meta.dir asset-path gotcha, the fixupPhase/strip gotcha (bare-bun binary exiting 0), an HTTP install check, and a clean flake with package/overlay/app/nixosModule.
 ---
 
 # SvelteKit → bun2nix package
@@ -11,19 +11,37 @@ holds only the binary + ICU — no `node_modules`, no Vite/Svelte/TypeScript.
 
 ## Mental model
 
-A SvelteKit build is **two steps**, which is why the simple `bun2nix.mkDerivation` (single-module
-compile) is *not* enough — use the `bun2nix.hook` inside `stdenv.mkDerivation` instead:
+A SvelteKit build is **two steps** — and both fit `bun2nix.mkDerivation`, because its default
+build phase runs `runHook preBuild` before `bun build $bunBuildFlags`:
 
-1. `bun run build` → `svelte-adapter-bun` emits a Bun server under `build/` (`index.js`,
-   `handler.js`, `server/`) plus static client assets under `build/client/` (and
+1. `preBuild`: `bun run build` → `svelte-adapter-bun` emits a Bun server under `build/`
+   (`index.js`, `handler.js`, `server/`) plus static client assets under `build/client/` (and
    `build/prerendered/` if any pages prerender).
-2. `bun build --compile` → AOT-compiles `build/index.js` into a single executable.
+2. `bunBuildFlags`: `bun build --compile` AOT-compiles `build/index.js` into a single executable.
+
+Do **not** drop to `bun2nix.hook` + a custom `buildPhase` for this: a custom `buildPhase` flips
+mkDerivation's `dontFixup` default back to false, and stdenv's fixupPhase (strip/patchelf)
+discards the module graph `bun build --compile` appends to the executable — leaving a bare `bun`
+CLI that prints help and **exits 0** (see gotcha below). With mkDerivation and no `buildPhase`
+override, `dontFixup = true` holds by construction.
 
 Dev tooling is build-time only and never enters the compiled binary — this is what satisfies
 "no dev packages in the output". (The *build* still needs devDeps; that's unavoidable and fine —
 `fetchBunDeps` fetches everything in `bun.nix` offline.)
 
-## The one real gotcha: `import.meta.dir`
+## Gotcha 1: fixupPhase strips the embedded app
+
+`bun build --compile` appends the app's module graph to a copy of the `bun` executable. stdenv's
+default fixupPhase (strip/patchelf) discards that appended data. The broken binary doesn't
+crash — it degrades into a bare `bun` CLI: prints the help text, **exits 0**, so a systemd
+service "starts" successfully and silently deactivates.
+
+`bun2nix.mkDerivation` defaults `dontFixup = true` for exactly this reason — but only when you
+don't pass a `buildPhase`. If you must override `buildPhase` (avoid it; use `preBuild` +
+`bunBuildFlags`), set `dontFixup = true;` explicitly. Either way, add the HTTP install check
+below: exit-code checks cannot catch this failure mode.
+
+## Gotcha 2: `import.meta.dir`
 
 `svelte-adapter-bun`'s `handler.js` locates static assets via `${import.meta.dir}/client` and
 `${import.meta.dir}/prerendered`. In a `bun build --compile` binary, `import.meta.dir` resolves
@@ -59,14 +77,17 @@ bun add -d svelte-adapter-bun bun2nix @types/bun
 
 ### 2. `default.nix`
 
+Use `bun2nix.mkDerivation`: no `buildPhase` override (keeps `dontFixup = true`), the vite build
+in `preBuild`, the compile via `bunBuildFlags`, and the assets in `postInstall` (the default
+install phase installs the binary, then runs `postInstall` from the project root).
+
 ```nix
-{ lib, stdenv, bun2nix }:
-stdenv.mkDerivation (finalAttrs: {
+{ lib, stdenv, bun2nix, curl }:
+bun2nix.mkDerivation (finalAttrs: {
   pname = "svelte-bun2nix-demo";
   version = "0.0.1";
   src = ./.;
 
-  nativeBuildInputs = [ bun2nix.hook ];
   bunDeps = bun2nix.fetchBunDeps { bunNix = ./bun.nix; };
 
   # Isolated linker can trip up Vite/SvelteKit on Darwin (per bun2nix hook docs).
@@ -75,33 +96,48 @@ stdenv.mkDerivation (finalAttrs: {
     "--backend=copyfile"
   ];
 
-  # We drive the build ourselves; disable the hook's default bun build/check.
-  dontUseBunBuild = true;
-  dontUseBunCheck = true;
-
-  buildPhase = ''
-    runHook preBuild
-
+  preBuild = ''
     bun run build   # -> build/ (Bun server + static client assets)
 
     # Bake the absolute store assets path in before compiling (import.meta.dir fix).
-    assets="${placeholder "out"}/share/${finalAttrs.pname}"
     substituteInPlace build/handler.js \
-      --replace-fail "import.meta.dir" "\"$assets\""
-
-    bun build --compile --minify --sourcemap \
-      build/index.js --outfile ${finalAttrs.pname}
-
-    runHook postBuild
+      --replace-fail "import.meta.dir" \
+        "\"${placeholder "out"}/share/${finalAttrs.pname}\""
   '';
 
-  installPhase = ''
-    runHook preInstall
-    install -Dm755 ${finalAttrs.pname} $out/bin/${finalAttrs.pname}
+  # Compile the emitted server, not the app source. Passing bunBuildFlags
+  # explicitly also skips mkDerivation's default --bytecode.
+  bunBuildFlags = [
+    "build/index.js"
+    "--outfile"
+    finalAttrs.pname
+    "--compile"
+    "--minify"
+    "--sourcemap"
+  ];
+
+  postInstall = ''
     mkdir -p $out/share/${finalAttrs.pname}
     cp -r build/client $out/share/${finalAttrs.pname}/client
     [ -d build/prerendered ] && cp -r build/prerendered $out/share/${finalAttrs.pname}/prerendered || true
-    runHook postInstall
+  '';
+
+  # A fixup-stripped binary exits 0 with bun's help text, so require real HTTP.
+  doInstallCheck = true;
+  nativeInstallCheckInputs = [ curl ];
+  installCheckPhase = ''
+    runHook preInstallCheck
+    HOST=127.0.0.1 PORT=18345 $out/bin/${finalAttrs.pname} &
+    server=$!
+    trap 'kill $server 2>/dev/null || true' EXIT
+    for i in $(seq 1 50); do
+      curl -fsS http://127.0.0.1:18345/ > /dev/null 2>&1 && {
+        echo "install check: server responded"; runHook postInstallCheck; exit 0; }
+      kill -0 $server 2>/dev/null || break   # bare-bun help text exits immediately
+      sleep 0.2
+    done
+    echo "install check: server never responded on :18345" >&2
+    exit 1
   '';
 
   meta = {
@@ -115,7 +151,8 @@ stdenv.mkDerivation (finalAttrs: {
 ### 3. `flake.nix` (mirrors the bun2nix react template's structure)
 
 Pin `bun2nix` to a real git **tag** (npm may be ahead of tags — check `git tag` on the repo).
-Consume its **overlay** so `pkgs.bun2nix` carries the `.hook` / `.fetchBunDeps` passthru.
+Consume its **overlay** so `pkgs.bun2nix` carries the `.mkDerivation` / `.fetchBunDeps` /
+`.hook` passthru.
 
 ```nix
 {
@@ -215,8 +252,12 @@ apply — check the `substituteInPlace` target/string.
 
 ## Pitfalls checklist
 
-- **Compile a single module, not the whole app** → don't use `bun2nix.mkDerivation` for
-  SvelteKit; use `bun2nix.hook` + custom `buildPhase`.
+- **Binary prints bun's CLI help / service exits 0 immediately** → fixupPhase stripped the
+  embedded module graph. Use `bun2nix.mkDerivation` without a `buildPhase` override
+  (`dontFixup = true` by default), or set `dontFixup = true;` explicitly. The HTTP install
+  check catches this at build time.
+- **Don't override `buildPhase`** → put the vite build in `preBuild` and the compile in
+  `bunBuildFlags`; a custom `buildPhase` silently re-enables fixup in mkDerivation.
 - **Assets 404 in the binary** → the `import.meta.dir` rewrite; don't forget to `cp` the assets
   into `$out/share/<pname>`.
 - **`substituteInPlace ... --replace-fail`** errors loudly if the pattern is missing (good — a
