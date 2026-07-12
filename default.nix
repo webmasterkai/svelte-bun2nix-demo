@@ -6,19 +6,22 @@
 }:
 # Build the SvelteKit demo into a single, standalone Bun binary.
 #
-# We use the `bun2nix` setup hook (rather than the simpler `bun2nix.mkDerivation`)
-# because a SvelteKit build is two steps: first `vite build` emits a Bun server
-# under `build/`, then we AOT-compile that server into one executable. All the dev
-# tooling (vite, svelte, the adapter, typescript) is only needed at build time and
-# is NOT part of the resulting binary's runtime closure.
-stdenv.mkDerivation (finalAttrs: {
+# A SvelteKit build is two steps: first `vite build` emits a Bun server under
+# `build/`, then we AOT-compile that server into one executable. Both fit
+# `bun2nix.mkDerivation`: the vite build runs in `preBuild` (the hook's default
+# bunBuildPhase runs preBuild before `bun build`), and `bunBuildFlags` points
+# the compile at the emitted server. All the dev tooling (vite, svelte, the
+# adapter, typescript) is only needed at build time and is NOT part of the
+# resulting binary's runtime closure.
+#
+# Because we don't override buildPhase, mkDerivation defaults `dontFixup = true`
+# — required: fixupPhase (strip/patchelf) would discard the module graph that
+# `bun build --compile` appends, leaving a bare `bun` CLI that exits 0.
+bun2nix.mkDerivation (finalAttrs: {
   pname = "svelte-bun2nix-demo";
   version = "0.0.1";
 
   src = ./.;
-
-  nativeBuildInputs = [ bun2nix.hook ];
-  nativeInstallCheckInputs = [ curl ];
 
   # Offline, reproducible Bun install cache built purely from ./bun.nix.
   bunDeps = bun2nix.fetchBunDeps {
@@ -32,58 +35,44 @@ stdenv.mkDerivation (finalAttrs: {
     "--backend=copyfile"
   ];
 
-  # We drive the build ourselves, so disable the hook's default bun build/check.
-  dontUseBunBuild = true;
-  dontUseBunCheck = true;
-
-  # `bun build --compile` appends the bundled module graph to the executable;
-  # fixupPhase (strip/patchelf) discards it, leaving a bare `bun` that prints CLI
-  # help. bun2nix's own mkDerivation defaults to dontFixup for the same reason.
-  dontFixup = true;
-
-  buildPhase = ''
-    runHook preBuild
-
+  preBuild = ''
     # 1. Build the SvelteKit app -> build/ (Bun server entry + static client assets).
     bun run build
 
     # 2. Bake the absolute (Nix store) assets path into the server handler.
     #    Once AOT-compiled, `import.meta.dir` points at the virtual bunfs root, so
     #    the server would otherwise fail to locate its client/prerendered assets.
-    assets="${placeholder "out"}/share/${finalAttrs.pname}"
     substituteInPlace build/handler.js \
-      --replace-fail "import.meta.dir" "\"$assets\""
-
-    # 3. AOT-compile the Bun server into a single self-contained binary.
-    #    Only runtime imports are bundled - no dev/build dependencies.
-    bun build \
-      --compile \
-      --minify \
-      --sourcemap \
-      build/index.js \
-      --outfile ${finalAttrs.pname}
-
-    runHook postBuild
+      --replace-fail "import.meta.dir" \
+        "\"${placeholder "out"}/share/${finalAttrs.pname}\""
   '';
 
-  installPhase = ''
-    runHook preInstall
+  # 3. AOT-compile the Bun server into a single self-contained binary.
+  #    Only runtime imports are bundled - no dev/build dependencies.
+  #    Explicit flags (no default --bytecode).
+  bunBuildFlags = [
+    "build/index.js"
+    "--outfile"
+    finalAttrs.pname
+    "--compile"
+    "--minify"
+    "--sourcemap"
+  ];
 
-    install -Dm755 ${finalAttrs.pname} $out/bin/${finalAttrs.pname}
-
+  # The default bunInstallPhase installs the binary; add the static assets.
+  postInstall = ''
     mkdir -p $out/share/${finalAttrs.pname}
     cp -r build/client $out/share/${finalAttrs.pname}/client
     if [ -d build/prerendered ]; then
       cp -r build/prerendered $out/share/${finalAttrs.pname}/prerendered
     fi
-
-    runHook postInstall
   '';
 
   # Smoke-test the installed binary: a broken compile (e.g. fixup stripping the
   # embedded module graph) degrades into a bare `bun` CLI that exits 0, so
   # actually start the server and require an HTTP response.
   doInstallCheck = true;
+  nativeInstallCheckInputs = [ curl ];
   installCheckPhase = ''
     runHook preInstallCheck
 
