@@ -46,7 +46,7 @@ store path of the assets into the server handler at build time.
 
 ```nix
 {
-  inputs.svelte-bun2nix-demo.url = "github:you/svelte-bun2nix-demo";
+  inputs.svelte-bun2nix-demo.url = "github:webmasterkai/svelte-bun2nix-demo";
 
   # then, per system:
   environment.systemPackages = [ inputs.svelte-bun2nix-demo.packages.${system}.default ];
