@@ -22,5 +22,8 @@
 		"svelte-check": "^4.6.0",
 		"typescript": "^6.0.3",
 		"vite": "^8.0.16"
+	},
+	"dependencies": {
+		"@nodeve/grimoire": "^4.0.2"
 	}
 }

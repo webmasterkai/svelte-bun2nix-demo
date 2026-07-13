@@ -1,25 +1,26 @@
 <script lang="ts">
-	let count = $state(0);
-	const doubled = $derived(count * 2);
+	let { data } = $props();
 </script>
 
 <svelte:head>
-	<title>SvelteKit × bun2nix</title>
+	<title>Grimoire archetypes</title>
 </svelte:head>
 
 <main>
-	<h1>SvelteKit → single Bun binary</h1>
+	<h1>Grimoire archetypes</h1>
 	<p>
-		This demo is built with <a href="https://svelte.dev/docs/kit">SvelteKit</a>, served by
-		<a href="https://bun.sh">Bun</a>, and packaged reproducibly for Nix with
-		<a href="https://github.com/nix-community/bun2nix">bun2nix</a>. The whole server is
-		AOT-compiled into one standalone executable — no <code>node_modules</code> at runtime.
+		Every archetype from <code>@nodeve/grimoire/archetypes</code>, rendered straight off the
+		package's generated def nodes — served by a single Bun binary built with bun2nix.
 	</p>
 
-	<button onclick={() => count++}>
-		clicked {count} {count === 1 ? 'time' : 'times'}
-	</button>
-	<p>doubled: {doubled}</p>
+	<ul>
+		{#each data.archetypes as a (a.slug)}
+			<li>
+				<a href="/{a.slug}">{a.title}</a>
+				{#if a.description}<p>{a.description}</p>{/if}
+			</li>
+		{/each}
+	</ul>
 </main>
 
 <style>
@@ -31,11 +32,23 @@
 		line-height: 1.6;
 	}
 
-	button {
-		font: inherit;
-		padding: 0.5rem 1rem;
-		border-radius: 0.5rem;
-		border: 1px solid currentColor;
-		cursor: pointer;
+	ul {
+		list-style: none;
+		padding: 0;
+	}
+
+	li {
+		padding: 0.75rem 0;
+		border-bottom: 1px solid #ddd;
+	}
+
+	li a {
+		font-weight: 600;
+	}
+
+	li p {
+		margin: 0.25rem 0 0;
+		color: #555;
+		font-size: 0.9rem;
 	}
 </style>
